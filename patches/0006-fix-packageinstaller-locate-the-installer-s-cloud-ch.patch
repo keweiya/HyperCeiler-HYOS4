@@ -1,4 +1,4 @@
-From 514cd467fa0f4a0016fe0994a01f0a445619cd60 Mon Sep 17 00:00:00 2001
+From 44fd80e155931d3d237700fff34fc03e85af0449 Mon Sep 17 00:00:00 2001
 From: keweiya <58689883+keweiya@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 16:47:03 +0000
 Subject: [PATCH 6/6] fix(packageinstaller): locate the installer's cloud-check
@@ -22,14 +22,14 @@ Verified against both attached installers: t2.r#a2(q2.l) is the anchor and its
 allowed branch calls t2.r#f2(q2.l) (u2(...,16,null); F1()); the old
 start_install/6-arg anchors are absent in both.
 ---
- .../packageinstaller/DisableCloudCheck.kt     | 148 +++++++++++-------
- 1 file changed, 89 insertions(+), 59 deletions(-)
+ .../packageinstaller/DisableCloudCheck.kt     | 153 +++++++++++-------
+ 1 file changed, 93 insertions(+), 60 deletions(-)
 
 diff --git a/library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/packageinstaller/DisableCloudCheck.kt b/library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/packageinstaller/DisableCloudCheck.kt
-index 269e0c1e2..d32092881 100644
+index 269e0c1e2..1947a90a9 100644
 --- a/library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/packageinstaller/DisableCloudCheck.kt
 +++ b/library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/packageinstaller/DisableCloudCheck.kt
-@@ -18,95 +18,125 @@
+@@ -18,95 +18,128 @@
  */
  package com.sevtinge.hyperceiler.libhook.rules.packageinstaller
  
@@ -160,32 +160,13 @@ index 269e0c1e2..d32092881 100644
                  }
              }
 -        }
-+        }.filter { it != button }
-+        return candidates.singleOrNull()
-+    }
-+
-+    override fun init() {
-+        val button = installButtonMethod ?: return
-+        val direct = directInstallMethod ?: return
-+        direct.isAccessible = true
- 
+-
 -        hookMethod(method1, object : IMethodHook {
-+        hookMethod(button, object : IMethodHook {
-             override fun before(param: HookParam) {
+-            override fun before(param: HookParam) {
 -                callMethod(param.thisObject, method2.name, param.args[0])
-+                // 原方法体是「按条件直接安装 / 改按钮文案 + 绑风险弹窗」二选一；
-+                // 这里直接走安装那一支，然后整段跳过原方法体。
-+                try {
-+                    direct.invoke(param.thisObject, *param.args)
-+                } catch (t: Throwable) {
-+                    XposedLog.w(
-+                        TAG, lpparam.packageName,
-+                        "DisableCloudCheck: direct install invoke failed: ${t.message}"
-+                    )
-+                }
-                 param.result = null
-             }
-         })
+-                param.result = null
+-            }
+-        })
 -
 -        methods.forEach { method ->
 -            try {
@@ -194,10 +175,17 @@ index 269e0c1e2..d32092881 100644
 -                        try {
 -                            val cloudParamsClass = findClass("com.miui.packageInstaller.model.CloudParams")
 -                            val cloudParamsInstance = cloudParamsClass.newInstance()
--
++        }.filter { it != button }
++        return candidates.singleOrNull()
++    }
+ 
 -                            val successClass = findClass("com.miui.packageInstaller.model.CloudResult\$Success")
 -                            val successConstructor = successClass.getDeclaredConstructor(cloudParamsClass)
--
++    override fun init() {
++        val button = installButtonMethod ?: return
++        val direct = directInstallMethod ?: return
++        direct.isAccessible = true
+ 
 -                            successConstructor.newInstance(cloudParamsInstance)
 -                        } catch (e: Exception) {
 -                            BaseHook.invokeOriginalMethod(
@@ -207,10 +195,26 @@ index 269e0c1e2..d32092881 100644
 -                            )
 -                        }
 -                    }
--                }
++        hookMethod(button, object : IMethodHook {
++            override fun before(param: HookParam) {
++                // 原方法体是「按条件直接安装 / 改按钮文案 + 绑风险弹窗」二选一；
++                // 这里直接走安装那一支，成功后才跳过原方法体。
++                // 调用失败就把原方法放回去跑，避免既没装成又被我们吞掉。
++                val invoked = try {
++                    direct.invoke(param.thisObject, *param.args)
++                    true
++                } catch (t: Throwable) {
++                    XposedLog.w(
++                        TAG, lpparam.packageName,
++                        "DisableCloudCheck: direct install invoke failed, fallback to stock: ${t.message}"
++                    )
++                    false
+                 }
 -            } catch (e: Exception) {
 -                // ignore
--            }
++                if (invoked) param.result = null
+             }
 -        }
++        })
      }
  }
