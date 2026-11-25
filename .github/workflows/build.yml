@@ -71,10 +71,12 @@ jobs:
             exit 1
           fi
           for p in "${patches[@]}"; do
-            echo "::group::$(basename "$p")"
-            if ! git -C src apply --3way --whitespace=nowarn "$p"; then
+            # git -C src 会把相对路径按 src/ 解析，补丁路径必须先转成绝对路径。
+            patch="$(realpath "$p")"
+            echo "::group::$(basename "$patch")"
+            if ! git -C src apply --3way --whitespace=nowarn "$patch"; then
               echo "3-way 失败，退回普通 apply"
-              git -C src apply --whitespace=nowarn "$p"
+              git -C src apply --whitespace=nowarn "$patch"
             fi
             echo "::endgroup::"
           done
