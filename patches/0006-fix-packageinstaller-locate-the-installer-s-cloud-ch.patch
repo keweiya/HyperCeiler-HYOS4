@@ -1,0 +1,216 @@
+From 514cd467fa0f4a0016fe0994a01f0a445619cd60 Mon Sep 17 00:00:00 2001
+From: keweiya <58689883+keweiya@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 16:47:03 +0000
+Subject: [PATCH 6/6] fix(packageinstaller): locate the installer's cloud-check
+ skip by structure only
+
+The old rule needed a "R.string.start_install" method and a six-argument
+(Context, ?, int, ApkInfo, HashMap, Continuation) cloud-check method. Neither
+exists in current installers (9.9.9.9.9 / 5.5.5.0.0), so initDexKit threw and
+the whole rule - including the install_btn anchor that still matched - was
+dropped.
+
+Rebuild the rule from two semantic anchors: the method that uses "install_btn"
+plus the constant 16, and, inside the same class, the same-prototype void method
+that this button method itself calls (the direct-install call its allowed branch
+makes). Hook the button method, invoke the direct-install method and null the
+result, so the button is never rewritten to "continue update" and the risk
+dialog listener is never bound. Any missing anchor returns false: the rule is
+skipped and the installer keeps its stock behaviour instead of crashing.
+
+Verified against both attached installers: t2.r#a2(q2.l) is the anchor and its
+allowed branch calls t2.r#f2(q2.l) (u2(...,16,null); F1()); the old
+start_install/6-arg anchors are absent in both.
+---
+ .../packageinstaller/DisableCloudCheck.kt     | 148 +++++++++++-------
+ 1 file changed, 89 insertions(+), 59 deletions(-)
+
+diff --git a/library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/packageinstaller/DisableCloudCheck.kt b/library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/packageinstaller/DisableCloudCheck.kt
+index 269e0c1e2..d32092881 100644
+--- a/library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/packageinstaller/DisableCloudCheck.kt
++++ b/library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/packageinstaller/DisableCloudCheck.kt
+@@ -18,95 +18,125 @@
+ */
+ package com.sevtinge.hyperceiler.libhook.rules.packageinstaller
+ 
+-import android.content.Context
++import com.sevtinge.hyperceiler.common.log.XposedLog
+ import com.sevtinge.hyperceiler.libhook.base.BaseHook
+-import io.github.lingqiqi5211.ezhooktool.xposed.java.IMethodHook
+-import com.sevtinge.hyperceiler.libhook.utils.hookapi.dexkit.DexKit
+ import io.github.lingqiqi5211.ezhooktool.xposed.common.HookParam
+-import io.github.lingqiqi5211.ezhooktool.xposed.dsl.createHook
++import io.github.lingqiqi5211.ezhooktool.xposed.java.IMethodHook
++import org.luckypray.dexkit.query.matchers.MethodMatcher
+ import java.lang.reflect.Method
+ 
++/**
++ * 跳过安装器的联网检测（云控）流程。
++ *
++ * 旧实现依赖三样东西：`install_btn` + 常量 16 定位按钮方法、一个带
++ * `R.string.start_install` 文本的方法、以及一个 6 参
++ * `(Context, ?, int, ApkInfo, HashMap, Continuation) -> Object` 的云检测方法。
++ * 新版安装器（9.9.9.9.9 / 5.5.5.0.0）里后两样在 dex 中已不存在，`initDexKit()`
++ * 直接抛异常，整条规则连第一个锚点都不注册。
++ *
++ * 现在只保留两个语义锚点，且都按结构判定，不写死混淆名：
++ *  1. 含 `install_btn` 字符串 + 常量 16 的方法（安装页初始化里的按钮流程）；
++ *  2. 同一个类里、参数类型与 1 完全相同、返回 void、同样使用常量 16 的方法
++ *     （真正发起安装的那个，反编译为 `u2(..., 16, null); F1()`）。
++ *
++ * hook 第 1 个方法：先调用第 2 个方法真正发起安装，再把返回值置空跳过原方法体，
++ * 于是按钮不会被改写成“继续更新”，也不会绑上点击后的风险弹窗。
++ *
++ * 任一锚点找不到就返回 false，让规则整体静默跳过（安装器保持原生行为），
++ * 而不是抛异常或 hook 到错误的方法。
++ */
+ object DisableCloudCheck : BaseHook() {
+ 
+     override fun useDexKit() = true
+ 
+-    override fun initDexKit(): Boolean {
+-        method1
+-        method2
+-        return true
+-    }
++    private var installButtonMethod: Method? = null
++    private var directInstallMethod: Method? = null
+ 
+-    private val method1 by lazy<Method> {
+-        requiredMember("NoNetworkInstallBtn") {
++    override fun initDexKit(): Boolean {
++        // 锚点 1：安装页初始化里带 "install_btn" 与常量 16 的方法。
++        val button = optionalMember<Method>("InstallButton") {
+             it.findMethod {
+                 matcher {
+                     usingStrings("install_btn")
+                     usingNumbers(16)
+                 }
+-            }.single()
++            }.singleOrNull()
++        }
++        if (button == null) {
++            XposedLog.w(
++                TAG, lpparam.packageName,
++                "DisableCloudCheck: no method uses \"install_btn\" + 16, rule skipped"
++            )
++            return false
+         }
+-    }
+ 
+-    private val method2 by lazy<Method> {
+-        requiredMember("NormalInstallBtn") {
++        // 锚点 2：同类的同参 void 方法，并且**由按钮方法自己调用**。
++        // 按钮方法里直接安装那一支就是 `f2(lVar)`，同类里同参数的方法还有
++        // 分发器/弹窗分支等（Y1、Z1、h2…），用调用关系才能唯一确定真正发起安装的那个，
++        // 不再依赖混淆名，也不用拿常量 16（很多分支都会传 16，区分度不够）。
++        val params = button.parameterTypes.map { it.name }
++        val direct = optionalMember<Method>("DirectInstall") {
+             it.findMethod {
+                 matcher {
+-                    usingStrings("getString(if (shouldUseU…e R.string.start_install)")
++                    declaredClass = button.declaringClass.name
++                    paramCount = params.size
++                    if (params.isNotEmpty()) paramTypes(*params.toTypedArray())
++                    returnType = "void"
++                    addCaller(MethodMatcher(button))
+                 }
+-            }.single()
++            }.singleOrNull()
++        } ?: uniqueFallback(button, params)
++        if (direct == null || direct.parameterTypes.size != button.parameterTypes.size) {
++            XposedLog.w(
++                TAG, lpparam.packageName,
++                "DisableCloudCheck: no direct-install method next to ${button.declaringClass.name}" +
++                    "#${button.name}, rule skipped"
++            )
++            return false
+         }
++
++        installButtonMethod = button
++        directInstallMethod = direct
++        return true
+     }
+ 
+-    override fun init() {
+-        // 签名对应：public final java.lang.Object c(Context, g, int, ApkInfo, HashMap, Continuation)
+-        val methods = DexKit.findMemberList<Method>("DisableCloudCheck_Fetch") {
++    /**
++     * 调用关系查询落空时的保守兜底：同类 + 同参数 + void，且只有一个候选时才采用。
++     * 多候选说明结构已经变化，宁可整条规则跳过，也不猜一个可能弹窗/递归的方法去调。
++     */
++    private fun uniqueFallback(button: Method, params: List<String>): Method? {
++        val candidates = optionalMemberList<Method>("DirectInstallFallback") {
+             it.findMethod {
+                 matcher {
+-                    paramCount = 6
+-                    paramTypes(
+-                        Context::class.java.name,
+-                        "",
+-                        Int::class.javaPrimitiveType?.name ?: "int",
+-                        "com.miui.packageInstaller.model.ApkInfo",
+-                        HashMap::class.java.name,
+-                        "kotlin.coroutines.Continuation"
+-                    )
+-                    returnType = Any::class.java.name
++                    declaredClass = button.declaringClass.name
++                    paramCount = params.size
++                    if (params.isNotEmpty()) paramTypes(*params.toTypedArray())
++                    returnType = "void"
+                 }
+             }
+-        }
++        }.filter { it != button }
++        return candidates.singleOrNull()
++    }
++
++    override fun init() {
++        val button = installButtonMethod ?: return
++        val direct = directInstallMethod ?: return
++        direct.isAccessible = true
+ 
+-        hookMethod(method1, object : IMethodHook {
++        hookMethod(button, object : IMethodHook {
+             override fun before(param: HookParam) {
+-                callMethod(param.thisObject, method2.name, param.args[0])
++                // 原方法体是「按条件直接安装 / 改按钮文案 + 绑风险弹窗」二选一；
++                // 这里直接走安装那一支，然后整段跳过原方法体。
++                try {
++                    direct.invoke(param.thisObject, *param.args)
++                } catch (t: Throwable) {
++                    XposedLog.w(
++                        TAG, lpparam.packageName,
++                        "DisableCloudCheck: direct install invoke failed: ${t.message}"
++                    )
++                }
+                 param.result = null
+             }
+         })
+-
+-        methods.forEach { method ->
+-            try {
+-                method.createHook {
+-                    replace { param ->
+-                        try {
+-                            val cloudParamsClass = findClass("com.miui.packageInstaller.model.CloudParams")
+-                            val cloudParamsInstance = cloudParamsClass.newInstance()
+-
+-                            val successClass = findClass("com.miui.packageInstaller.model.CloudResult\$Success")
+-                            val successConstructor = successClass.getDeclaredConstructor(cloudParamsClass)
+-
+-                            successConstructor.newInstance(cloudParamsInstance)
+-                        } catch (e: Exception) {
+-                            BaseHook.invokeOriginalMethod(
+-                                param.executable as Method,
+-                                param.thisObject,
+-                                param.args
+-                            )
+-                        }
+-                    }
+-                }
+-            } catch (e: Exception) {
+-                // ignore
+-            }
+-        }
+     }
+ }

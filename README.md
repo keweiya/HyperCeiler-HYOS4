@@ -23,6 +23,7 @@ docs/                         功能说明与验证记录（HyperCeiler-r4801-�
 | `0003-fix-module-stop-flagging-self-built-packages-as-bad-signatures.patch` | 模块：去掉自编译包的「签名校验失败」首页横幅 |
 | `0004-fix-home-keep-the-folder-open-guard-in-the-auto-close-patch.patch` | 桌面：保留 `isFolderClingOpen` 保护门，桌面点击不再误入关闭流程 |
 | `0005-fix-module-declare-static-scope-so-LSPosed-loads-int.patch` | 模块：`staticScope=true` / `minApiVersion=102`，否则 LSPosed 不会注入由 hyos_spawner 拉起的桌面进程，桌面类功能不生效 |
+| `0006-fix-packageinstaller-locate-the-installer-s-cloud-ch.patch` | 安装器：去掉 `start_install` 文本与 6 参云检测方法的硬编码，改用 `install_btn`+16 与「按钮方法自己调用的同参 void 方法」两个结构锚点；锚点缺失时规则静默跳过 |
 
 细节与真机验证方法见 [docs/HyperCeiler-r4801-三功能说明.md](docs/HyperCeiler-r4801-三功能说明.md)。
 

@@ -1,7 +1,7 @@
 From eb7f671245a01edef0cca60a3300f73469fb3e6f Mon Sep 17 00:00:00 2001
 From: keweiya <58689883+keweiya@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 11:09:14 +0000
-Subject: [PATCH 1/5] feat(home): port HomeTweaks folder auto-close
+Subject: [PATCH 1/6] feat(home): port HomeTweaks folder auto-close
 
 Replace the older single-gate auto-close with the HomeTweaks 81
 ("folderautoclose") strategy: both early gates on the click path are NOP'ed so

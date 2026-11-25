@@ -1,7 +1,7 @@
 From 52a9bb35372bd2c10a4a2c0efe26ddfb48d83ee9 Mon Sep 17 00:00:00 2001
 From: keweiya <58689883+keweiya@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 12:01:35 +0000
-Subject: [PATCH 4/5] fix(home): keep the folder-open guard in the auto-close
+Subject: [PATCH 4/6] fix(home): keep the folder-open guard in the auto-close
  patch
 
 The auto-close port NOP'ed the wrong second gate: it neutralised the
