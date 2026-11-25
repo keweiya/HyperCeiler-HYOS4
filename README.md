@@ -22,6 +22,7 @@ docs/                         功能说明与验证记录（HyperCeiler-r4801-�
 | `0002-feat-systemui-let-dual-row-signal-stack-with-non-WiFi-hide-mode.patch` | SystemUI：双排信号与「非 WiFi 下始终显示」可叠加，去掉互斥 |
 | `0003-fix-module-stop-flagging-self-built-packages-as-bad-signatures.patch` | 模块：去掉自编译包的「签名校验失败」首页横幅 |
 | `0004-fix-home-keep-the-folder-open-guard-in-the-auto-close-patch.patch` | 桌面：保留 `isFolderClingOpen` 保护门，桌面点击不再误入关闭流程 |
+| `0005-fix-module-declare-static-scope-so-LSPosed-loads-int.patch` | 模块：`staticScope=true` / `minApiVersion=102`，否则 LSPosed 不会注入由 hyos_spawner 拉起的桌面进程，桌面类功能不生效 |
 
 细节与真机验证方法见 [docs/HyperCeiler-r4801-三功能说明.md](docs/HyperCeiler-r4801-三功能说明.md)。
 

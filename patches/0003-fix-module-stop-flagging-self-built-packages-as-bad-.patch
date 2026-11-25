@@ -1,7 +1,7 @@
 From 3acf26ac5f1262a88e9f2b17ede9cb384fd4b24b Mon Sep 17 00:00:00 2001
 From: keweiya <58689883+keweiya@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 11:09:38 +0000
-Subject: [PATCH 3/4] fix(module): stop flagging self-built packages as bad
+Subject: [PATCH 3/5] fix(module): stop flagging self-built packages as bad
  signatures
 
 The home page renders a "signature verification failed" warning banner whenever

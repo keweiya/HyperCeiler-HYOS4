@@ -1,7 +1,7 @@
 From 06d8c3be4968ca497529602831ea0821011c8cdf Mon Sep 17 00:00:00 2001
 From: keweiya <58689883+keweiya@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 11:09:37 +0000
-Subject: [PATCH 2/4] feat(systemui): let dual-row signal stack with non-WiFi
+Subject: [PATCH 2/5] feat(systemui): let dual-row signal stack with non-WiFi
  hide mode
 
 "Double row signal bar" and "always show when not on Wi-Fi" (signal mode 1)

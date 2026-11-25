@@ -1,0 +1,25 @@
+From 7b1789f7548e9d9b2ba481186a3d5c6256ac0047 Mon Sep 17 00:00:00 2001
+From: keweiya <58689883+keweiya@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 16:11:32 +0000
+Subject: [PATCH 5/5] fix(module): declare static scope so LSPosed loads into
+ the HyperOS launcher
+
+The launcher is spawned by hyos_spawner, and LSPosed only injects modules that
+declare staticScope=true there (com.miui.home.tweaks, the only module visible in
+that process, declares minApiVersion=102 + staticScope=true). Without this the
+home hooks - including the folder auto-close patch - never load.
+---
+ .../libhook/src/main/resources/META-INF/xposed/module.prop   | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/library/libhook/src/main/resources/META-INF/xposed/module.prop b/library/libhook/src/main/resources/META-INF/xposed/module.prop
+index f893fca33..3bccadae1 100644
+--- a/library/libhook/src/main/resources/META-INF/xposed/module.prop
++++ b/library/libhook/src/main/resources/META-INF/xposed/module.prop
+@@ -1,4 +1,3 @@
+-minApiVersion=101
++minApiVersion=102
+ targetApiVersion=102
+-autoHotReload=true
+-staticScope=false
++staticScope=true
