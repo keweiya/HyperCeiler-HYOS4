@@ -1,0 +1,190 @@
+From 52a9bb35372bd2c10a4a2c0efe26ddfb48d83ee9 Mon Sep 17 00:00:00 2001
+From: keweiya <58689883+keweiya@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:01:35 +0000
+Subject: [PATCH 4/4] fix(home): keep the folder-open guard in the auto-close
+ patch
+
+The auto-close port NOP'ed the wrong second gate: it neutralised the
+isFolderClingOpen guard and left Inst|isRegistered in place, so every click on a
+desktop icon walked into handleFolderClingClose with no folder open. The close
+routine then occasionally threw before the launch continuation, which is why
+apps sometimes refused to start.
+
+Match HomeTweaks 81 exactly: NOP only the click-mode gate and the controller
+registration gate, and keep the third gate (FolderClingGetxController
+.isFolderClingOpen) untouched as the 'a folder is really open' guard. Desktop
+clicks now stay on the plain launch path; the scroll gate inside the close
+routine is still rewritten.
+---
+ .../cpp/targets/home/home_folder_auto_close.h | 50 +++++++++++--------
+ .../cpp/targets/home/home_layout_hooks.cpp    | 11 ++--
+ .../folder-auto-close-os4/auto_close_test.cpp | 18 ++++---
+ 3 files changed, 49 insertions(+), 30 deletions(-)
+
+diff --git a/app/src/main/cpp/targets/home/home_folder_auto_close.h b/app/src/main/cpp/targets/home/home_folder_auto_close.h
+index 96d8aaae4..b91cd2841 100644
+--- a/app/src/main/cpp/targets/home/home_folder_auto_close.h
++++ b/app/src/main/cpp/targets/home/home_folder_auto_close.h
+@@ -16,16 +16,19 @@ inline uint32_t auto_close_call(uint32_t pc, uint32_t w) {
+ // HomeTweaks 81 ("folderautoclose"): a click inside an open folder must run the
+ // launcher's own close-then-launch block, with the stock animated close. The stock
+ // code reaches that block only when two early tests already say "folder closed", so
+-// both are neutralised instead of replacing the close with a synchronous variant:
++// exactly those two are neutralised (2x NOP):
+ //   1. the mode gate reading the click model (fp spill -> RxObjectMixin.value),
+-//   2. the folder-open gate (registered controller -> Rx value in the heap),
+-//   3. inside the close routine, the grid re-scroll gate becomes an unconditional
+-//      branch, so closing no longer starts a second scroll animation.
+-// The launch continuation, the registration test and every blocked-launch guard are
+-// left untouched.
++//   2. the controller-registration gate (Inst|isRegistered -> tbnz).
++// The third gate -- the one reading FolderClingGetxController.isFolderClingOpen --
++// is the "a folder is really open" guard and MUST stay intact: it is what keeps
++// desktop clicks on the plain launch path. NOP'ing it (the previous port did) runs
++// the close routine on every icon click and occasionally aborts the launch.
++// Inside the close routine the grid re-scroll gate becomes an unconditional branch,
++// so closing does not start a second scroll animation.
+ struct FolderAutoClosePlan {
+-    uint32_t mode_gate = 0;        // byte offset in the click body
+-    uint32_t open_gate = 0;        // byte offset in the click body
++    uint32_t mode_gate = 0;        // byte offset in the click body (patched)
++    uint32_t registered_gate = 0;  // byte offset in the click body (patched)
++    uint32_t open_guard = 0;       // byte offset in the click body (kept as-is)
+     uint32_t scroll_gate = 0;      // byte offset in the close body
+     uint32_t scroll_branch = 0;    // replacement word: b <scroll continuation>
+ };
+@@ -45,30 +48,36 @@ inline std::optional<FolderAutoClosePlan> resolve_folder_auto_close(
+         || body[close_at - 2] != 0x910082c2 || body[close_at - 1] != 0xf9403b64) return {};
+     const uint32_t end = va + uint32_t((close_at + 1) * 4);
+     unsigned registered_calls = 0;
+-    size_t mode = 0, open = 0; unsigned mode_hits = 0, open_hits = 0;
++    size_t mode = 0, registered_gate = 0, guard = 0;
++    unsigned mode_hits = 0, registered_hits = 0, guard_hits = 0;
+     for (size_t i = 2; i < close_at; ++i) {
+         if ((body[i] & 0xfc000000u) == 0x94000000u
+             && auto_close_call(va + uint32_t(i * 4), body[i]) == registered) ++registered_calls;
+-        // Every candidate gate is a TBNZ on the Rx result that jumps past the close.
++        // Every candidate gate is a TBNZ on the Rx/bool result that jumps past the close.
+         if ((body[i] & 0xfff80000u) != 0x37200000u || (body[i] & 31u) != 0u) continue;
+         int32_t jump = int32_t(((body[i] >> 5) & 0x3fffu) << 18) >> 18;
+         if (int64_t(va) + int64_t(i * 4) + int64_t(jump) * 4 != end) continue;
+-        if ((body[i - 1] & 0xfc000000u) != 0x94000000u
+-            || auto_close_call(va + uint32_t((i - 1) * 4), body[i - 1]) != rx) continue;
+-        // Mode gate: the tested value was spilled to the Dart frame by this caller.
++        if ((body[i - 1] & 0xfc000000u) != 0x94000000u) continue;
++        const uint32_t callee = auto_close_call(va + uint32_t((i - 1) * 4), body[i - 1]);
++        // Gate 2: Inst|isRegistered result. HomeTweaks NOPs this one.
++        if (callee == registered) { registered_gate = i; ++registered_hits; continue; }
++        if (callee != rx) continue;
++        // Gate 1: the tested value was spilled to the Dart frame by this caller.
+         if ((body[i - 2] & 0xffe00fffu) == 0xf84003a1u && ((body[i - 2] >> 12) & 0x100)) {
+             mode = i; ++mode_hits;
+-        // Open gate: the tested value is a heap field of the controller, loaded
+-        // through ldur w1,[x0,#imm] / add x1,x1,x28,lsl#32 just before Rx.
++        // Gate 3: isFolderClingOpen read through ldur w1,[x0,#imm] / add x1,x1,x28,lsl#32.
++        // This one is the guard that keeps desktop clicks untouched; it is validated
++        // but never rewritten.
+         } else if (body[i - 2] == 0x8b1c8021u
+             && (body[i - 3] & 0xffe00c00u) == 0xb8400000u
+             && (body[i - 3] & 31u) == 1u && ((body[i - 3] >> 5) & 31u) == 0u) {
+-            open = i; ++open_hits;
++            guard = i; ++guard_hits;
+         }
+     }
+-    // Each gate must be unique and in stock order: mode, then open registration,
+-    // then the open gate, then the close call.
+-    if (mode_hits != 1 || open_hits != 1 || registered_calls != 1 || !(mode < open && open < close_at)) return {};
++    // Each gate must be unique and in stock order: mode, then registration, then the
++    // isFolderClingOpen guard, then the close call.
++    if (mode_hits != 1 || registered_hits != 1 || guard_hits != 1 || registered_calls != 1
++        || !(mode < registered_gate && registered_gate < guard && guard < close_at)) return {};
+     // Scroll gate: ldur w2,[x1,#imm] / add x2,x2,x28 / tbnz w2,#4 -> continuation,
+     // immediately followed by the scroll routine. Only that branch is rewritten.
+     size_t scroll_at = 0, scroll_hits = 0; uint32_t branch = 0;
+@@ -92,7 +101,8 @@ inline std::optional<FolderAutoClosePlan> resolve_folder_auto_close(
+     if (scroll_hits != 1) return {};
+     FolderAutoClosePlan plan;
+     plan.mode_gate = uint32_t(mode * 4);
+-    plan.open_gate = uint32_t(open * 4);
++    plan.registered_gate = uint32_t(registered_gate * 4);
++    plan.open_guard = uint32_t(guard * 4);
+     plan.scroll_gate = uint32_t(scroll_at * 4);
+     plan.scroll_branch = branch;
+     return plan;
+diff --git a/app/src/main/cpp/targets/home/home_layout_hooks.cpp b/app/src/main/cpp/targets/home/home_layout_hooks.cpp
+index 3fac3844f..8bed4390f 100644
+--- a/app/src/main/cpp/targets/home/home_layout_hooks.cpp
++++ b/app/src/main/cpp/targets/home/home_layout_hooks.cpp
+@@ -4428,7 +4428,10 @@ bool sync_folder_auto_close(bool enabled) {
+             const auto plan=home_layout::resolve_folder_auto_close(body,va,close,rx,registered,close_body,scroll);
+             std::array<nhk::SourceWordPatch,3> prepared{};
+             bool compatible=plan.has_value();
+-            const uint32_t sites[3]={plan?plan->mode_gate:0,plan?plan->open_gate:0,plan?plan->scroll_gate:0};
++            // HomeTweaks NOPs the mode and registration gates only; the
++            // isFolderClingOpen guard (plan->open_guard) stays, so a click on a
++            // desktop icon never runs the folder-close routine.
++            const uint32_t sites[3]={plan?plan->mode_gate:0,plan?plan->registered_gate:0,plan?plan->scroll_gate:0};
+             const uint32_t words[3]={home_layout::kFolderAutoCloseReplacement,
+                 home_layout::kFolderAutoCloseReplacement,plan?plan->scroll_branch:0};
+             const uint32_t owner[3]={va,va,close};
+@@ -4450,8 +4453,8 @@ bool sync_folder_auto_close(bool enabled) {
+             if(compatible) {
+                 g_auto_close_words=prepared;g_auto_close_generation_valid=true;
+                 __android_log_print(ANDROID_LOG_INFO,kTag,
+-                    "folder auto-close HomeTweaks plan mode=%#x open=%#x scroll=%#x target=%#x animated-close=stock",
+-                    va+plan->mode_gate,va+plan->open_gate,close+plan->scroll_gate,
++                    "folder auto-close HomeTweaks plan mode=%#x registered=%#x guard=%#x scroll=%#x target=%#x animated-close=stock",
++                    va+plan->mode_gate,va+plan->registered_gate,va+plan->open_guard,close+plan->scroll_gate,
+                     uint32_t(int64_t(close)+int64_t(plan->scroll_gate)
+                         +int64_t(int32_t(plan->scroll_branch<<6)>>6)*4));
+             }
+@@ -4473,7 +4476,7 @@ bool sync_folder_auto_close(bool enabled) {
+     if(!g_auto_close_reported || g_auto_close_request!=enabled || g_auto_close_result!=applied) {
+         g_auto_close_reported=true;g_auto_close_request=enabled;g_auto_close_result=applied;
+         __android_log_print(applied?ANDROID_LOG_INFO:ANDROID_LOG_WARN,kTag,
+-            "folder auto-close source-word requested=%d applied=%d sites=3 guards=mode,open(nop) scroll=skip animated-close=stock",enabled,applied);
++            "folder auto-close source-word requested=%d applied=%d sites=3 nop=mode,registered scroll=skip open-guard=kept animated-close=stock",enabled,applied);
+     }
+     return applied;
+ }
+diff --git a/tests/folder-auto-close-os4/auto_close_test.cpp b/tests/folder-auto-close-os4/auto_close_test.cpp
+index a08117ea2..ff7f1142e 100644
+--- a/tests/folder-auto-close-os4/auto_close_test.cpp
++++ b/tests/folder-auto-close-os4/auto_close_test.cpp
+@@ -68,16 +68,21 @@ int main(int argc, char **argv) {
+     auto plan = home_layout::resolve_folder_auto_close(click_body, click, close, rx, registered,
+         close_body, scroll);
+     assert(plan);
+-    std::printf("plan mode=%#x open=%#x scroll=%#x branch=%#x\n",
+-        click + plan->mode_gate, click + plan->open_gate, close + plan->scroll_gate, plan->scroll_branch);
++    std::printf("plan mode=%#x registered=%#x guard=%#x scroll=%#x branch=%#x\n",
++        click + plan->mode_gate, click + plan->registered_gate, click + plan->open_guard,
++        close + plan->scroll_gate, plan->scroll_branch);
+     assert(click + plan->mode_gate == 0x1451218);
+-    assert(click + plan->open_gate == 0x1451280);
++    assert(click + plan->registered_gate == 0x145124c);
++    assert(click + plan->open_guard == 0x1451280);
+     assert(close + plan->scroll_gate == 0x1933dc8);
+     assert(plan->scroll_branch == 0x14000019);
+-    // The words the plan replaces must be the stock instructions HomeTweaks rewrites.
++    // The two words HomeTweaks NOPs must be the stock gates, and the
++    // isFolderClingOpen guard must remain the untouched third gate.
+     assert(click_body[plan->mode_gate / 4] == 0x372006c0);
+-    assert(click_body[plan->open_gate / 4] == 0x37200380);
++    assert(click_body[plan->registered_gate / 4] == 0x37200520);
++    assert(click_body[plan->open_guard / 4] == 0x37200380);
+     assert(close_body[plan->scroll_gate / 4] == 0x37200322);
++    assert(plan->scroll_gate != plan->registered_gate && plan->scroll_gate != plan->mode_gate);
+     // Every single-word corruption of either owner body must be refused or move the plan.
+     unsigned accepted = 0, refused = 0;
+     for (size_t i = 0; i < click_body.size(); ++i) {
+@@ -86,7 +91,8 @@ int main(int argc, char **argv) {
+             close_body, scroll);
+         if (!again) { ++refused; continue; }
+         ++accepted;
+-        assert(again->mode_gate == plan->mode_gate && again->open_gate == plan->open_gate);
++        assert(again->mode_gate == plan->mode_gate && again->registered_gate == plan->registered_gate
++            && again->open_guard == plan->open_guard);
+     }
+     for (size_t i = 0; i < close_body.size(); ++i) {
+         auto altered = close_body; altered[i] ^= 1u;

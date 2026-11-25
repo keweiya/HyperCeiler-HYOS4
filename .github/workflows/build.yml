@@ -1,0 +1,133 @@
+name: Build patched HyperCeiler
+
+# 只做一件事：拉取 ReChronoRain/HyperCeiler 上游源码，套用 patches/ 里的补丁，
+# 构建 canary APK 并上传为 artifact。本仓库不保存上游源码。
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "ReChronoRain/HyperCeiler 的 commit / tag / branch（留空使用固定基线）"
+        required: false
+        default: ""
+      task:
+        description: "Gradle 任务"
+        required: false
+        type: choice
+        default: assembleCanary
+        options:
+          - assembleCanary
+          - assembleDebug
+  push:
+    branches: [main]
+    paths:
+      - "patches/**"
+      - ".github/workflows/**"
+      - "README.md"
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  UPSTREAM_REPOSITORY: ReChronoRain/HyperCeiler
+  # 补丁 rebase 时所用的上游提交（2026-11-25）。上游前移后 patches 可能对不上，
+  # 需要用同样的方式重新 rebase 并更新这里。
+  UPSTREAM_BASE: 79ddb292acc29007705d0e08bb047443c49ca66f
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    name: Build App
+    steps:
+      - name: Checkout patch repository
+        uses: actions/checkout@v4
+
+      - name: Resolve upstream ref
+        id: ref
+        run: |
+          set -euo pipefail
+          REF="${{ github.event.inputs.upstream_ref }}"
+          if [ -z "$REF" ]; then REF="$UPSTREAM_BASE"; fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "upstream ref: $REF"
+
+      - name: Checkout upstream HyperCeiler
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ steps.ref.outputs.ref }}
+          path: src
+          fetch-depth: 0
+          submodules: true
+
+      - name: Apply patches
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          patches=(patches/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "patches/ 目录为空，没有可套用的补丁"
+            exit 1
+          fi
+          for p in "${patches[@]}"; do
+            echo "::group::$(basename "$p")"
+            if ! git -C src apply --3way --whitespace=nowarn "$p"; then
+              echo "3-way 失败，退回普通 apply"
+              git -C src apply --whitespace=nowarn "$p"
+            fi
+            echo "::endgroup::"
+          done
+          git -C src status --short | head -40
+
+      - name: Setup JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Prepare signing material
+        working-directory: src
+        env:
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ALIAS }}
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "${SIGNING_KEY:-}" ]; then
+            printf 'storePassword=%s\nkeyAlias=%s\nkeyPassword=%s\nstoreFile=../key.jks\n' \
+              "${KEY_STORE_PASSWORD}" "${KEY_ALIAS}" "${KEY_STORE_PASSWORD}" > signing.properties
+            printf '%s' "${SIGNING_KEY}" | base64 --decode > key.jks
+            echo "签名：使用仓库密钥（$KEY_ALIAS）"
+          else
+            echo "签名：未配置 SIGNING_KEY，回退 debug 签名"
+          fi
+
+      - name: Build
+        working-directory: src
+        env:
+          GIT_ACTOR: ${{ secrets.GIT_ACTOR }}
+          GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
+          TASK: ${{ github.event.inputs.task || 'assembleCanary' }}
+        run: |
+          set -euo pipefail
+          ./gradlew "$TASK"
+
+      - name: Collect APK
+        run: |
+          set -euo pipefail
+          APK=$(find src/app/build/outputs/apk -name '*.apk' | head -1)
+          if [ -z "$APK" ]; then echo "没有找到 APK"; exit 1; fi
+          echo "apk=$APK" >> "$GITHUB_ENV"
+          echo "apk_name=$(basename "$APK" .apk)" >> "$GITHUB_ENV"
+          sha256sum "$APK"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.apk_name }}
+          path: ${{ env.apk }}
+          compression-level: 9

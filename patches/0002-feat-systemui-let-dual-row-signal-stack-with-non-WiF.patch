@@ -1,0 +1,135 @@
+From 06d8c3be4968ca497529602831ea0821011c8cdf Mon Sep 17 00:00:00 2001
+From: keweiya <58689883+keweiya@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 11:09:37 +0000
+Subject: [PATCH 2/4] feat(systemui): let dual-row signal stack with non-WiFi
+ hide mode
+
+"Double row signal bar" and "always show when not on Wi-Fi" (signal mode 1)
+were mutually exclusive: the settings page disabled the dual-row entry and both
+SystemUI loaders refused to install DualRowSignalHookV whenever any signal mode
+was set, so picking the Wi-Fi hide mode silently dropped the dual-row icons.
+
+- MobileNetworkSettings: only hidden SIM cards still cancel the dual-row entry;
+  signal mode 1 no longer disables it.
+- SystemUIB/SystemUIV: install the dual-row hook for modes 0/1, keep it off for
+  the data-SIM-only modes 2/3.
+- MobilePublicHookV: route dual-row through refreshVisibility so the Wi-Fi hide
+  mode also applies while dual-row renders, and keep slot 1+ hidden so the
+  launcher does not paint a second pair of rows.
+---
+ .../statusbar/MobileNetworkSettings.java      |  4 ++-
+ .../libhook/app/SystemUI/SystemUIB.java       |  4 ++-
+ .../libhook/app/SystemUI/SystemUIV.java       |  4 ++-
+ .../statusbar/mobile/MobilePublicHookV.kt     | 33 +++++++++++--------
+ 4 files changed, 28 insertions(+), 17 deletions(-)
+
+diff --git a/library/core/src/main/java/com/sevtinge/hyperceiler/hooker/systemui/statusbar/MobileNetworkSettings.java b/library/core/src/main/java/com/sevtinge/hyperceiler/hooker/systemui/statusbar/MobileNetworkSettings.java
+index 0440deee5..294e452db 100644
+--- a/library/core/src/main/java/com/sevtinge/hyperceiler/hooker/systemui/statusbar/MobileNetworkSettings.java
++++ b/library/core/src/main/java/com/sevtinge/hyperceiler/hooker/systemui/statusbar/MobileNetworkSettings.java
+@@ -102,7 +102,9 @@ public class MobileNetworkSettings extends DashboardFragment {
+             mHideCard1.setSummary("");
+             mHideCard2.setEnabled(true);
+             mHideCard2.setSummary("");
+-            if (signalMode == 1 || card1Checked || card2Checked) {
++            // 双排信号与「非 WiFi 下始终显示」(signalMode 1) 可叠加，不再为此禁用双排；
++            // 只有「隐藏 SIM 卡图标」仍与双排互斥（双排必须为两张卡各渲染一排）。
++            if (card1Checked || card2Checked) {
+                 mDoubleMobile.setEnabled(false);
+                 mDoubleMobile.setSummary(R.string.system_ui_statusbar_iconmanage_nosupport_mobile_network);
+             } else {
+diff --git a/library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/app/SystemUI/SystemUIB.java b/library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/app/SystemUI/SystemUIB.java
+index 55b3cd2d1..16418f539 100644
+--- a/library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/app/SystemUI/SystemUIB.java
++++ b/library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/app/SystemUI/SystemUIB.java
+@@ -286,8 +286,10 @@ public class SystemUIB extends BaseLoad {
+         initHook(SwapWiFiAndMobileNetwork.INSTANCE, PrefsBridge.getBoolean("system_ui_status_bar_swap_wifi_and_mobile_network"));
+         // 移动网络图标
+         boolean isEnabledDualRowSignal = PrefsBridge.getBoolean("system_ui_statusbar_network_icon_enable");
++        // 双排只在「非 WiFi 下始终显示」(1) 时仍可加载，与信号显示逻辑叠加；
++        // 2/3 是「仅状态栏显示 / 仅显示数据卡」，与双排互斥。
+         initHook(new DualRowSignalHookV(), isEnabledDualRowSignal && !(
+-                PrefsBridge.getStringAsInt("system_ui_status_bar_icon_mobile_network_signal_mode", 0) != 0 ||
++                PrefsBridge.getStringAsInt("system_ui_status_bar_icon_mobile_network_signal_mode", 0) >= 2 ||
+                 PrefsBridge.getBoolean("system_ui_status_bar_icon_mobile_network_hide_card_1") ||
+                 PrefsBridge.getBoolean("system_ui_status_bar_icon_mobile_network_hide_card_2")
+             )
+diff --git a/library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/app/SystemUI/SystemUIV.java b/library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/app/SystemUI/SystemUIV.java
+index 060b7ba2c..70b39148f 100644
+--- a/library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/app/SystemUI/SystemUIV.java
++++ b/library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/app/SystemUI/SystemUIV.java
+@@ -310,8 +310,10 @@ public class SystemUIV extends BaseLoad {
+         initHook(SwapWiFiAndMobileNetwork.INSTANCE, PrefsBridge.getBoolean("system_ui_status_bar_swap_wifi_and_mobile_network"));
+         // 移动网络图标
+         boolean isEnabledDualRowSignal = PrefsBridge.getBoolean("system_ui_statusbar_network_icon_enable");
++        // 双排只在「非 WiFi 下始终显示」(1) 时仍可加载，与信号显示逻辑叠加；
++        // 2/3 是「仅状态栏显示 / 仅显示数据卡」，与双排互斥。
+         initHook(new DualRowSignalHookV(), isEnabledDualRowSignal && !(
+-                PrefsBridge.getStringAsInt("system_ui_status_bar_icon_mobile_network_signal_mode", 0) != 0 ||
++                PrefsBridge.getStringAsInt("system_ui_status_bar_icon_mobile_network_signal_mode", 0) >= 2 ||
+                 PrefsBridge.getBoolean("system_ui_status_bar_icon_mobile_network_hide_card_1") ||
+                 PrefsBridge.getBoolean("system_ui_status_bar_icon_mobile_network_hide_card_2")
+             )
+diff --git a/library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/systemui/statusbar/mobile/MobilePublicHookV.kt b/library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/systemui/statusbar/mobile/MobilePublicHookV.kt
+index 6b524660a..db65b3c7b 100644
+--- a/library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/systemui/statusbar/mobile/MobilePublicHookV.kt
++++ b/library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/systemui/statusbar/mobile/MobilePublicHookV.kt
+@@ -139,23 +139,13 @@ class MobilePublicHookV : BaseHook() {
+         val isVisible = createVisibilityFlow()
+ 
+         when {
+-            // 信号显示逻辑
+-            signalShowMode >= 1 -> {
++            // 信号显示逻辑 / 双排信号：统一交给 refreshVisibility 计算，两者可叠加
++            signalShowMode >= 1 || dualRowEnabled() -> {
+                 cellularIcon.setObjectField("isVisible", isVisible)
+                 trackVisibilityFlow(subId, isVisible)
+                 refreshVisibility(subId, isVisible)
+                 registerReceiver(EzXposed.appContext)
+             }
+-            // 双排信号（signalShowMode == 0 且未隐藏卡）
+-            isEnableDouble && !(card1 || card2) -> {
+-                cellularIcon.setObjectField("isVisible", isVisible)
+-                trackVisibilityFlow(subId, isVisible)
+-                val slotIndex = SubscriptionManager.getSlotIndex(subId)
+-                val shouldShow = !MobileViewHelper.isAirplaneModeOn() &&
+-                    (MobileViewHelper.isSingleSimMode() || slotIndex == 0)
+-                updateVisibility(isVisible, shouldShow)
+-                registerReceiver(EzXposed.appContext)
+-            }
+             // 隐藏指定卡
+             else -> {
+                 val slotIndex = SubscriptionManager.getSlotIndex(subId)
+@@ -322,7 +312,22 @@ class MobilePublicHookV : BaseHook() {
+             3 -> !isAirplane && subId == defaultDataSubId
+             else -> !isAirplane && (MobileViewHelper.isSingleSimMode() || slotIndex == 0)
+         }
+-        updateVisibility(isVisible, shouldShow)
++        updateVisibility(isVisible, shouldShow && !dualRowHidesSlot(subId))
++    }
++
++    /** 双排信号开关已打开且没有隐藏单卡时，两张卡都由 slot 0 的视图渲染。 */
++    private fun dualRowEnabled(): Boolean {
++        return isEnableDouble && !(card1 || card2)
++    }
++
++    /**
++     * 双排只绘制 slot 0 的 root（DualRowSignalHookV 自己建的两排列也在它下面），
++     * slot 1+ 的 root 必须一直隐藏，否则会叠出第二套双排图标。
++     * 与「非 WiFi 下始终显示」叠加时，slot 0 仍按 signalShowMode 正常隐藏。
++     */
++    private fun dualRowHidesSlot(subId: Int): Boolean {
++        if (!dualRowEnabled() || MobileViewHelper.isSingleSimMode()) return false
++        return SubscriptionManager.getSlotIndex(subId) > 0
+     }
+ 
+     @RequiresPermission(allOf = [Manifest.permission.ACCESS_NETWORK_STATE, Manifest.permission.READ_PHONE_STATE])
+@@ -342,7 +347,7 @@ class MobilePublicHookV : BaseHook() {
+             } else {
+                 !isAirplane && (isSingleSim || SubscriptionManager.getSlotIndex(subId) == 0)
+             }
+-            updateVisibility(isVisible, shouldShow)
++            updateVisibility(isVisible, shouldShow && !dualRowHidesSlot(subId))
+         }
+     }
+ 

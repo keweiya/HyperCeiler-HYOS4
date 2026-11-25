@@ -1,0 +1,432 @@
+From eb7f671245a01edef0cca60a3300f73469fb3e6f Mon Sep 17 00:00:00 2001
+From: keweiya <58689883+keweiya@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 11:09:14 +0000
+Subject: [PATCH 1/4] feat(home): port HomeTweaks folder auto-close
+
+Replace the older single-gate auto-close with the HomeTweaks 81
+("folderautoclose") strategy: both early gates on the click path are NOP'ed so
+a click inside an open folder runs the launcher's own close-then-launch block
+with the stock animated close, and the grid re-scroll gate in the close routine
+becomes an unconditional branch so closing does not start a second scroll.
+
+The plan is decoded from the image and refuses on any ambiguity; three source
+words are journaled through the existing apply/settle path, so turning the
+switch off restores them byte for byte.
+---
+ .../cpp/targets/home/home_folder_auto_close.h | 151 ++++++++++--------
+ .../cpp/targets/home/home_layout_hooks.cpp    |  42 ++---
+ .../folder-auto-close-os4/auto_close_test.cpp | 122 ++++++++++++++
+ tests/folder-auto-close-os4/run.py            |  22 +++
+ 4 files changed, 248 insertions(+), 89 deletions(-)
+ create mode 100644 tests/folder-auto-close-os4/auto_close_test.cpp
+ create mode 100755 tests/folder-auto-close-os4/run.py
+
+diff --git a/app/src/main/cpp/targets/home/home_folder_auto_close.h b/app/src/main/cpp/targets/home/home_folder_auto_close.h
+index 2c89f9a72..96d8aaae4 100644
+--- a/app/src/main/cpp/targets/home/home_folder_auto_close.h
++++ b/app/src/main/cpp/targets/home/home_folder_auto_close.h
+@@ -8,85 +8,94 @@
+ namespace home_layout {
+ constexpr const char* kFolderAutoClickSymbol = "AppIconRemoteClick.handleRemoteClick";
+ constexpr uint32_t kFolderAutoCloseMagic = 0x48434641;
+-constexpr uint32_t kFolderAutoCloseReplacement = 0xd503201f; // One aligned NOP, no Dart ABI crossing.
++constexpr uint32_t kFolderAutoCloseReplacement = 0xd503201f; // NOP, no Dart ABI crossing.
+ inline uint32_t auto_close_call(uint32_t pc, uint32_t w) {
+     int32_t imm = int32_t(w << 6) >> 6;
+     return uint32_t(int64_t(pc) + int64_t(imm) * 4);
+ }
+-// Admit ONLY the mode gate guarding stock close logic. Folder registration/open tests and
+-// all blocked-launch/recents guards remain intact. No field/pool offset or code VA is a profile.
+-inline std::optional<size_t> resolve_folder_auto_close(std::span<const uint32_t> body,
+-    uint32_t va, uint32_t close, uint32_t rx, uint32_t registered) {
++// HomeTweaks 81 ("folderautoclose"): a click inside an open folder must run the
++// launcher's own close-then-launch block, with the stock animated close. The stock
++// code reaches that block only when two early tests already say "folder closed", so
++// both are neutralised instead of replacing the close with a synchronous variant:
++//   1. the mode gate reading the click model (fp spill -> RxObjectMixin.value),
++//   2. the folder-open gate (registered controller -> Rx value in the heap),
++//   3. inside the close routine, the grid re-scroll gate becomes an unconditional
++//      branch, so closing no longer starts a second scroll animation.
++// The launch continuation, the registration test and every blocked-launch guard are
++// left untouched.
++struct FolderAutoClosePlan {
++    uint32_t mode_gate = 0;        // byte offset in the click body
++    uint32_t open_gate = 0;        // byte offset in the click body
++    uint32_t scroll_gate = 0;      // byte offset in the close body
++    uint32_t scroll_branch = 0;    // replacement word: b <scroll continuation>
++};
++inline std::optional<FolderAutoClosePlan> resolve_folder_auto_close(
++    std::span<const uint32_t> body, uint32_t va, uint32_t close, uint32_t rx, uint32_t registered,
++    std::span<const uint32_t> close_body, uint32_t scroll) {
+     if (body.size() < 8 || body[0] != 0xa9bf79fd || body[1] != 0xaa0f03fd) return {};
+     size_t close_at = 0, close_count = 0;
+-    for (size_t i=0;i<body.size();++i)
+-        if ((body[i]&0xfc000000u)==0x94000000u && auto_close_call(va+uint32_t(i*4),body[i])==close) {close_at=i;++close_count;}
+-    if (close_count!=1 || close_at<4 || close_at+1>=body.size()
+-        || body[close_at-2]!=0x910082c2 || body[close_at-1]!=0xf9403b64) return {};
+-    const uint32_t end=va+uint32_t((close_at+1)*4);
+-    size_t gate=0, count=0, registers=0, open=0;
+-    for (size_t i=2;i<close_at;++i) {
+-        if ((body[i]&0xfff8001fu)!=0x37200000u) continue; // tbnz w0,#4
+-        int32_t jump=int32_t(((body[i]>>5)&0x3fff)<<18)>>18;
+-        if (int64_t(va)+int64_t(i*4)+int64_t(jump)*4!=end) continue;
+-        const auto call=body[i-1]; if ((call&0xfc000000u)!=0x94000000u) continue;
+-        const auto target=auto_close_call(va+uint32_t((i-1)*4),call);
+-        // ldur x1,[fp,#negative spill], not a heap field getter or another launch test.
+-        if (target==rx && (body[i-2]&0xffe00fffu)==0xf84003a1u
+-            && ((body[i-2]>>12)&0x100)) {gate=i;++count;}
+-        else if (target==registered) ++registers;
+-        else if (target==rx && body[i-2]==0x8b1c8021u) ++open;
+-    }
+-    if (count!=1 || registers!=1 || open!=1) return {};
+-    // The order is mode -> registered -> open -> stock close; later gates are never patched.
+-    size_t reg_at=0, open_at=0;
+-    for(size_t i=gate+1;i<close_at;++i) {
+-        if((body[i]&0xfc000000u)!=0x94000000u)continue;
+-        auto t=auto_close_call(va+uint32_t(i*4),body[i]);
+-        if(t==registered){reg_at=i;}if(t==rx){open_at=i;}
+-    }
+-    if(!(gate<reg_at && reg_at<open_at && open_at<close_at))return {};
+-    return gate*4;
+-}
+-// Auto-close must finish synchronously before the untouched launch continuation.
+-// Animated close awaits snapshot/scrollNearestRow and can complete after launch,
+-// bringing Home back above the new task. Only this click's animation argument is
+-// changed; manual Back/blank-area close and their animations remain original.
+-constexpr uint32_t kFolderAutoCloseImmediate = 0x9100c2c2; // Dart false -> x2
+-inline bool close_animation_argument(std::span<const uint32_t> b,uint32_t va,
+-    uint32_t should_animate,uint32_t immediate,uint32_t scroll) {
+-    using namespace home_dynamic;
+-    int32_t incoming=0,field=0;unsigned captures=0,uses=0,fast=0,slow=0;
+-    for(size_t i=2;i<b.size() && i<24;++i)
+-        if(stx(b[i],29,2) && slot(imm9(b[i]))) {incoming=imm9(b[i]);++captures;}
+-    if(captures!=1)return false;
+-    unsigned stores=0;
+-    for(size_t i=0;i+1<b.size();++i)
+-        if(ldx(b[i],29,0) && imm9(b[i])==incoming
+-            && mem(b[i+1],0xb8000000,2,0) && home_dynamic::field(imm9(b[i+1]))) {
+-            field=imm9(b[i+1]);++stores;
++    for (size_t i = 0; i < body.size(); ++i)
++        if ((body[i] & 0xfc000000u) == 0x94000000u
++            && auto_close_call(va + uint32_t(i * 4), body[i]) == close) {
++            close_at = i; ++close_count;
+         }
+-    if(stores!=1)return false;
+-    for(size_t i=3;i<b.size();++i) {
+-        uint32_t callee=0;if(!target(b[i],va+uint32_t(i*4),callee))continue;
+-        if(callee==immediate){++fast;}if(callee==scroll){++slow;}
+-        if(callee==should_animate && ldw(b[i-3],0,2) && imm9(b[i-3])==field
+-            && b[i-2]==0x8b1c8042u && ldx(b[i-1],29,1))++uses;
+-    }
+-    return uses==1 && fast==1 && slow==1;
+-}
+-inline std::optional<std::array<size_t,2>> resolve_folder_auto_close_immediate(
+-    std::span<const uint32_t> click,uint32_t va,uint32_t close,uint32_t rx,uint32_t registered,
+-    std::span<const uint32_t> close_body,uint32_t should_animate,uint32_t immediate,uint32_t scroll) {
+-    auto gate=resolve_folder_auto_close(click,va,close,rx,registered);
+-    if(!gate || !close_animation_argument(close_body,close,should_animate,immediate,scroll))return {};
+-    size_t argument=0,hits=0;
+-    for(size_t i=2;i<click.size();++i)
+-        if((click[i]&0xfc000000u)==0x94000000u && auto_close_call(va+uint32_t(i*4),click[i])==close) {
+-            argument=(i-2)*4;++hits;
++    // The close call carries the animated flag in x2 (add x2,x22,#0x20) and the
++    // dispatch record in x4; a close invoked with any other shape is not this path.
++    if (close_count != 1 || close_at < 4 || close_at + 1 > body.size()
++        || body[close_at - 2] != 0x910082c2 || body[close_at - 1] != 0xf9403b64) return {};
++    const uint32_t end = va + uint32_t((close_at + 1) * 4);
++    unsigned registered_calls = 0;
++    size_t mode = 0, open = 0; unsigned mode_hits = 0, open_hits = 0;
++    for (size_t i = 2; i < close_at; ++i) {
++        if ((body[i] & 0xfc000000u) == 0x94000000u
++            && auto_close_call(va + uint32_t(i * 4), body[i]) == registered) ++registered_calls;
++        // Every candidate gate is a TBNZ on the Rx result that jumps past the close.
++        if ((body[i] & 0xfff80000u) != 0x37200000u || (body[i] & 31u) != 0u) continue;
++        int32_t jump = int32_t(((body[i] >> 5) & 0x3fffu) << 18) >> 18;
++        if (int64_t(va) + int64_t(i * 4) + int64_t(jump) * 4 != end) continue;
++        if ((body[i - 1] & 0xfc000000u) != 0x94000000u
++            || auto_close_call(va + uint32_t((i - 1) * 4), body[i - 1]) != rx) continue;
++        // Mode gate: the tested value was spilled to the Dart frame by this caller.
++        if ((body[i - 2] & 0xffe00fffu) == 0xf84003a1u && ((body[i - 2] >> 12) & 0x100)) {
++            mode = i; ++mode_hits;
++        // Open gate: the tested value is a heap field of the controller, loaded
++        // through ldur w1,[x0,#imm] / add x1,x1,x28,lsl#32 just before Rx.
++        } else if (body[i - 2] == 0x8b1c8021u
++            && (body[i - 3] & 0xffe00c00u) == 0xb8400000u
++            && (body[i - 3] & 31u) == 1u && ((body[i - 3] >> 5) & 31u) == 0u) {
++            open = i; ++open_hits;
+         }
+-    if(hits!=1 || click[argument/4]!=0x910082c2u)return {};
+-    return std::array<size_t,2>{*gate,argument};
++    }
++    // Each gate must be unique and in stock order: mode, then open registration,
++    // then the open gate, then the close call.
++    if (mode_hits != 1 || open_hits != 1 || registered_calls != 1 || !(mode < open && open < close_at)) return {};
++    // Scroll gate: ldur w2,[x1,#imm] / add x2,x2,x28 / tbnz w2,#4 -> continuation,
++    // immediately followed by the scroll routine. Only that branch is rewritten.
++    size_t scroll_at = 0, scroll_hits = 0; uint32_t branch = 0;
++    for (size_t i = 3; i < close_body.size(); ++i) {
++        if ((close_body[i] & 0xfc000000u) != 0x94000000u
++            || auto_close_call(close + uint32_t(i * 4), close_body[i]) != scroll) continue;
++        if ((close_body[i - 1] & 0xfff80000u) != 0x37200000u
++            || (close_body[i - 1] & 31u) != 2u) continue;
++        int32_t jump = int32_t(((close_body[i - 1] >> 5) & 0x3fffu) << 18) >> 18;
++        const int64_t pc = int64_t(close) + int64_t((i - 1) * 4);
++        const int64_t target = pc + int64_t(jump) * 4;
++        const int64_t delta = target - pc;
++        if (close_body[i - 2] != 0x8b1c8042u
++            || (close_body[i - 3] & 0xffe00c00u) != 0xb8400000u
++            || (close_body[i - 3] & 31u) != 2u || ((close_body[i - 3] >> 5) & 31u) != 1u
++            || delta <= 0 || (delta & 3) != 0 || delta > 0x7fffffc) return {};
++        scroll_at = i - 1;
++        branch = 0x14000000u | uint32_t(delta >> 2);
++        ++scroll_hits;
++    }
++    if (scroll_hits != 1) return {};
++    FolderAutoClosePlan plan;
++    plan.mode_gate = uint32_t(mode * 4);
++    plan.open_gate = uint32_t(open * 4);
++    plan.scroll_gate = uint32_t(scroll_at * 4);
++    plan.scroll_branch = branch;
++    return plan;
+ }
+ template<class Read> bool read_folder_auto_close(Read read,bool& enabled,bool optional=true) {
+     int32_t magic=0,flag=0;enabled=false;
+diff --git a/app/src/main/cpp/targets/home/home_layout_hooks.cpp b/app/src/main/cpp/targets/home/home_layout_hooks.cpp
+index 2256d01b1..3fac3844f 100644
+--- a/app/src/main/cpp/targets/home/home_layout_hooks.cpp
++++ b/app/src/main/cpp/targets/home/home_layout_hooks.cpp
+@@ -4170,7 +4170,7 @@ bool g_dock_title_generation_valid = false;
+ bool g_dock_title_model_bound=false;
+ std::atomic_bool g_dock_title_patches_ready{false};
+ bool g_dock_title_reported = false, g_dock_title_request = false, g_dock_title_result = false;
+-std::array<nhk::SourceWordPatch,2> g_auto_close_words{};
++std::array<nhk::SourceWordPatch,3> g_auto_close_words{};
+ std::atomic_flag g_auto_close_busy = ATOMIC_FLAG_INIT;
+ bool g_auto_close_generation_valid = false;
+ bool g_auto_close_reported = false, g_auto_close_request = false, g_auto_close_result = false;
+@@ -4416,38 +4416,44 @@ bool sync_folder_auto_close(bool enabled) {
+     struct Release { ~Release() { g_auto_close_busy.clear(std::memory_order_release); } } release;
+     if (!g_dart || (!enabled && !g_auto_close_words[0].address)) return !enabled;
+     if (!g_auto_close_words[0].address) {
+-        uint32_t va=0,span=0,close=0,rx=0,registered=0,size=0,animate=0,immediate=0,scroll=0;
++        uint32_t va=0,span=0,close=0,rx=0,registered=0,size=0,scroll=0,scroll_span=0;
+         std::vector<uint32_t> body,close_body;
+         if (home_layout_engine::HomeLayoutEngineFindSymbol(home_layout::kFolderAutoClickSymbol,&va,&size)
+             && home_layout_engine::HomeLayoutEngineFindSymbol("FolderClingGetxController.handleFolderClingClose",&close,&size)
+             && home_layout_engine::HomeLayoutEngineFindSymbol("RxObjectMixin.value",&rx,&size)
+             && home_layout_engine::HomeLayoutEngineFindSymbol("Inst|isRegistered",&registered,&size)
+-            && home_layout_engine::HomeLayoutEngineFindSymbol("FolderClingGetxController._shouldCloseWithAnimation",&animate,&size)
+-            && home_layout_engine::HomeLayoutEngineFindSymbol("FolderClingGetxController.handleFolderClingCloseImmediately",&immediate,&size)
+             && home_layout_engine::HomeLayoutEngineFindSymbol("FolderGridViewGetxController.scrollNearestRow",&scroll,&size)
+             && dartscan::function_span(va,&span) && dart_function_words(va,span,body)
+-            && dartscan::body(close,close_body)) {
+-            const auto offsets=home_layout::resolve_folder_auto_close_immediate(body,va,close,rx,registered,
+-                close_body,animate,immediate,scroll);
+-            std::array<nhk::SourceWordPatch,2> prepared{};
+-            bool compatible=offsets.has_value();
++            && dartscan::function_span(close,&scroll_span) && dart_function_words(close,scroll_span,close_body)) {
++            const auto plan=home_layout::resolve_folder_auto_close(body,va,close,rx,registered,close_body,scroll);
++            std::array<nhk::SourceWordPatch,3> prepared{};
++            bool compatible=plan.has_value();
++            const uint32_t sites[3]={plan?plan->mode_gate:0,plan?plan->open_gate:0,plan?plan->scroll_gate:0};
++            const uint32_t words[3]={home_layout::kFolderAutoCloseReplacement,
++                home_layout::kFolderAutoCloseReplacement,plan?plan->scroll_branch:0};
++            const uint32_t owner[3]={va,va,close};
++            const std::vector<uint32_t>* owner_body[3]={&body,&body,&close_body};
+             for(size_t i=0;compatible && i<prepared.size();++i) {
+-                const size_t offset=(*offsets)[i];
+-                if(offset>UINT32_MAX-va || g_dart->load_base>UINTPTR_MAX-va-offset) {compatible=false;break;}
+-                const uint32_t site=va+uint32_t(offset);
++                const uint32_t base=owner[i], offset=sites[i];
++                if(offset>UINT32_MAX-base || g_dart->load_base>UINTPTR_MAX-base-offset) {compatible=false;break;}
++                const uint32_t site=base+offset;
+                 const uintptr_t address=g_dart->load_base+site;
+                 const auto file=dart_file_offset(site,4);
+                 const auto source=nhk::source_at(g_dart->owned,address,4);
++                // The word we replace must be the one the plan decoded, byte for byte.
+                 if(!file || !source || nhk::add_overflows(g_dart->view_begin,*file)
+-                    || source->file_offset!=g_dart->view_begin+*file || (address&3)) {compatible=false;break;}
+-                prepared[i]={address,body[offset/4],i==0 ? home_layout::kFolderAutoCloseReplacement
+-                    : home_layout::kFolderAutoCloseImmediate,*source};
++                    || source->file_offset!=g_dart->view_begin+*file || (address&3)
++                    || offset/4>=(*owner_body[i]).size()
++                    || (*owner_body[i])[offset/4]==words[i]) {compatible=false;break;}
++                prepared[i]={address,(*owner_body[i])[offset/4],words[i],*source};
+             }
+             if(compatible) {
+                 g_auto_close_words=prepared;g_auto_close_generation_valid=true;
+                 __android_log_print(ANDROID_LOG_INFO,kTag,
+-                    "folder auto-close dynamic gate=%#x animation-arg=%#x immediate=1 sites=2",
+-                    va+uint32_t((*offsets)[0]),va+uint32_t((*offsets)[1]));
++                    "folder auto-close HomeTweaks plan mode=%#x open=%#x scroll=%#x target=%#x animated-close=stock",
++                    va+plan->mode_gate,va+plan->open_gate,close+plan->scroll_gate,
++                    uint32_t(int64_t(close)+int64_t(plan->scroll_gate)
++                        +int64_t(int32_t(plan->scroll_branch<<6)>>6)*4));
+             }
+         }
+     }
+@@ -4467,7 +4473,7 @@ bool sync_folder_auto_close(bool enabled) {
+     if(!g_auto_close_reported || g_auto_close_request!=enabled || g_auto_close_result!=applied) {
+         g_auto_close_reported=true;g_auto_close_request=enabled;g_auto_close_result=applied;
+         __android_log_print(applied?ANDROID_LOG_INFO:ANDROID_LOG_WARN,kTag,
+-            "folder auto-close source-word requested=%d applied=%d sites=2 immediate=1 registered/open/launch guards=original",enabled,applied);
++            "folder auto-close source-word requested=%d applied=%d sites=3 guards=mode,open(nop) scroll=skip animated-close=stock",enabled,applied);
+     }
+     return applied;
+ }
+diff --git a/tests/folder-auto-close-os4/auto_close_test.cpp b/tests/folder-auto-close-os4/auto_close_test.cpp
+new file mode 100644
+index 000000000..a08117ea2
+--- /dev/null
++++ b/tests/folder-auto-close-os4/auto_close_test.cpp
+@@ -0,0 +1,122 @@
++/* SPDX-License-Identifier: AGPL-3.0-or-later */
++// Host audit of the HomeTweaks "auto close folder" plan against a real launcher
++// image. Nothing here runs on the device; it proves the three source words and
++// that the resolver refuses any altered click/close body.
++#include "targets/home/home_folder_auto_close.h"
++#include <cassert>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <iterator>
++#include <string>
++#include <vector>
++
++namespace {
++struct Image {
++    std::vector<unsigned char> data;
++    std::vector<std::pair<uint64_t, uint64_t>> loads; // vaddr, filesz
++    bool open(const char *path) {
++        std::ifstream in(path, std::ios::binary);
++        if (!in) return false;
++        data.assign(std::istreambuf_iterator<char>{in}, {});
++        if (data.size() < 64 || std::memcmp(data.data(), "\x7f""ELF", 4) != 0) return false;
++        uint64_t phoff = 0;
++        std::memcpy(&phoff, data.data() + 32, 8);
++        uint16_t phentsize = 0, phnum = 0;
++        std::memcpy(&phentsize, data.data() + 54, 2);
++        std::memcpy(&phnum, data.data() + 56, 2);
++        for (uint16_t i = 0; i < phnum; ++i) {
++            const unsigned char *p = data.data() + phoff + i * phentsize;
++            uint32_t type = 0, flags = 0;
++            uint64_t offset = 0, vaddr = 0, filesz = 0;
++            std::memcpy(&type, p, 4); std::memcpy(&flags, p + 4, 4);
++            std::memcpy(&offset, p + 8, 8); std::memcpy(&vaddr, p + 16, 8);
++            std::memcpy(&filesz, p + 32, 8);
++            if (type == 1 && flags == 5) loads.emplace_back(vaddr, filesz);
++        }
++        return !loads.empty();
++    }
++    std::vector<uint32_t> words(uint32_t va, size_t count) const {
++        for (const auto &l : loads) {
++            if (va < l.first || uint64_t(va) - l.first + count * 4 > l.second) continue;
++            std::vector<uint32_t> out(count);
++            std::memcpy(out.data(), data.data() + l.first + (va - l.first), count * 4);
++            return out;
++        }
++        return {};
++    }
++};
++} // namespace
++
++int main(int argc, char **argv) {
++    if (argc != 9) {
++        std::fprintf(stderr, "usage: %s libapp.so click_va close_va scroll_va rx_va registered_va\n", argv[0]);
++        return 2;
++    }
++    Image image;
++    if (!image.open(argv[1])) { std::fprintf(stderr, "not an ELF\n"); return 2; }
++    const auto hexarg = [](const char *s) { return uint32_t(std::strtoul(s, nullptr, 16)); };
++    const uint32_t click = hexarg(argv[2]), click_size = hexarg(argv[3]);
++    const uint32_t close = hexarg(argv[4]), close_size = hexarg(argv[5]);
++    const uint32_t scroll = hexarg(argv[6]);
++    const uint32_t rx = hexarg(argv[7]), registered = hexarg(argv[8]);
++    assert(!(click_size % 4) && !(close_size % 4));
++    const auto click_body = image.words(click, click_size / 4);
++    const auto close_body = image.words(close, close_size / 4);
++    assert(!click_body.empty() && !close_body.empty());
++    auto plan = home_layout::resolve_folder_auto_close(click_body, click, close, rx, registered,
++        close_body, scroll);
++    assert(plan);
++    std::printf("plan mode=%#x open=%#x scroll=%#x branch=%#x\n",
++        click + plan->mode_gate, click + plan->open_gate, close + plan->scroll_gate, plan->scroll_branch);
++    assert(click + plan->mode_gate == 0x1451218);
++    assert(click + plan->open_gate == 0x1451280);
++    assert(close + plan->scroll_gate == 0x1933dc8);
++    assert(plan->scroll_branch == 0x14000019);
++    // The words the plan replaces must be the stock instructions HomeTweaks rewrites.
++    assert(click_body[plan->mode_gate / 4] == 0x372006c0);
++    assert(click_body[plan->open_gate / 4] == 0x37200380);
++    assert(close_body[plan->scroll_gate / 4] == 0x37200322);
++    // Every single-word corruption of either owner body must be refused or move the plan.
++    unsigned accepted = 0, refused = 0;
++    for (size_t i = 0; i < click_body.size(); ++i) {
++        auto altered = click_body; altered[i] ^= 1u;
++        auto again = home_layout::resolve_folder_auto_close(altered, click, close, rx, registered,
++            close_body, scroll);
++        if (!again) { ++refused; continue; }
++        ++accepted;
++        assert(again->mode_gate == plan->mode_gate && again->open_gate == plan->open_gate);
++    }
++    for (size_t i = 0; i < close_body.size(); ++i) {
++        auto altered = close_body; altered[i] ^= 1u;
++        auto again = home_layout::resolve_folder_auto_close(click_body, click, close, rx, registered,
++            altered, scroll);
++        if (!again) { ++refused; continue; }
++        ++accepted;
++        assert(again->scroll_gate == plan->scroll_gate);
++    }
++    // Removing the close call, or making the scroll call ambiguous, must be refused.
++    auto no_close = click_body;
++    for (size_t i = 0; i < no_close.size(); ++i)
++        if ((no_close[i] & 0xfc000000u) == 0x94000000u
++            && home_layout::auto_close_call(click + uint32_t(i * 4), no_close[i]) == close)
++            no_close[i] = 0xd503201f;
++    assert(!home_layout::resolve_folder_auto_close(no_close, click, close, rx, registered, close_body, scroll));
++    // A second identical gate+call sequence must be refused as ambiguous.
++    auto twice = close_body;
++    for (size_t i = 3; i + 5 < twice.size(); ++i)
++        if ((twice[i] & 0xfc000000u) == 0x94000000u
++            && home_layout::auto_close_call(close + uint32_t(i * 4), twice[i]) == scroll) {
++            for (size_t k = 0; k < 4; ++k) twice[i + 4 + k] = twice[i - 3 + k];
++            // Re-encode the copy's BL for its own address; a verbatim copy would not
++            // reach the scroll routine and would prove nothing.
++            const int64_t delta = int64_t(scroll) - int64_t(close + uint32_t((i + 7) * 4));
++            assert(delta % 4 == 0 && delta > 0 && delta <= 0x7fffffc);
++            twice[i + 7] = 0x94000000u | uint32_t(delta >> 2);
++            break;
++        }
++    assert(!home_layout::resolve_folder_auto_close(click_body, click, close, rx, registered, twice, scroll));
++    std::printf("PASS auto-close plan: 3 sites, mutations accepted=%u refused=%u\n", accepted, refused);
++    return 0;
++}
+diff --git a/tests/folder-auto-close-os4/run.py b/tests/folder-auto-close-os4/run.py
+new file mode 100755
+index 000000000..332c41c0c
+--- /dev/null
++++ b/tests/folder-auto-close-os4/run.py
+@@ -0,0 +1,22 @@
++#!/usr/bin/env python3
++"""Run the host audit of the HomeTweaks auto-close plan on a real launcher image."""
++from pathlib import Path
++import subprocess, sys, tempfile
++root = Path(__file__).resolve().parents[2]
++sys.path.insert(0, str(root / 'tests/home-layout-native'))
++from dart_dump import Symbols
++elf, mini = (Path(a).resolve() for a in sys.argv[1:3])
++s = Symbols(mini)
++def va(n): return s.by_name[n]
++click, click_size = va('AppIconRemoteClick.handleRemoteClick')
++close, close_size = va('FolderClingGetxController.handleFolderClingClose')
++scroll = va('FolderGridViewGetxController.scrollNearestRow')[0]
++rx = va('RxObjectMixin.value')[0]
++registered = va('Inst|isRegistered')[0]
++with tempfile.TemporaryDirectory(prefix='auto-close-') as tmp:
++    exe = Path(tmp) / 't'
++    subprocess.run(['g++', '-std=c++20', '-O2', '-Wall', '-Wextra', '-Werror', '-I',
++        str(root / 'app/src/main/cpp'),
++        str(Path(__file__).with_name('auto_close_test.cpp')), '-o', str(exe)], check=True)
++    subprocess.run([str(exe), str(elf), f'{click:x}', f'{click_size:x}', f'{close:x}',
++        f'{close_size:x}', f'{scroll:x}', f'{rx:x}', f'{registered:x}'], check=True)

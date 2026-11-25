@@ -1,0 +1,42 @@
+From 3acf26ac5f1262a88e9f2b17ede9cb384fd4b24b Mon Sep 17 00:00:00 2001
+From: keweiya <58689883+keweiya@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 11:09:38 +0000
+Subject: [PATCH 3/4] fix(module): stop flagging self-built packages as bad
+ signatures
+
+The home page renders a "signature verification failed" warning banner whenever
+the APK is not signed with the official key, which is every self-built package.
+Drop that branch so a locally compiled module no longer greets the user with a
+tampering warning.
+---
+ .../hyperceiler/home/banner/HomePageBannerManager.java | 10 ++--------
+ 1 file changed, 2 insertions(+), 8 deletions(-)
+
+diff --git a/app/src/main/java/com/sevtinge/hyperceiler/home/banner/HomePageBannerManager.java b/app/src/main/java/com/sevtinge/hyperceiler/home/banner/HomePageBannerManager.java
+index 802df4dd6..59b90b78b 100644
+--- a/app/src/main/java/com/sevtinge/hyperceiler/home/banner/HomePageBannerManager.java
++++ b/app/src/main/java/com/sevtinge/hyperceiler/home/banner/HomePageBannerManager.java
+@@ -18,7 +18,6 @@ import android.os.SystemClock;
+ import com.sevtinge.hyperceiler.R;
+ import com.sevtinge.hyperceiler.common.log.AndroidLog;
+ import com.sevtinge.hyperceiler.common.log.LoggerHealthChecker;
+-import com.sevtinge.hyperceiler.expansion.utils.SignUtils;
+ import com.sevtinge.hyperceiler.libhook.safecrash.CrashScope;
+ import com.sevtinge.hyperceiler.utils.FrameworkStatusManager;
+ 
+@@ -179,13 +178,8 @@ public class HomePageBannerManager {
+     }
+ 
+     private static BannerBean createWarningBannerIfNeeded(Context context) {
+-        if (!SignUtils.isSignCheckPass(context)) {
+-            return createWarningBanner(
+-                "warning_sign",
+-                context.getString(R.string.headtip_warn_sign_verification_failed),
+-                null
+-            );
+-        }
++        // 本构建使用自签名证书（与官方发布包不同），签名校验必然失败。
++        // 该告警只对官方渠道升级有意义，自编译版本不再展示「签名校验失败」横幅。
+         if (isUnofficialRom(context)) {
+             return createWarningBanner(
+                 "warning_rom",
